@@ -1,88 +1,105 @@
-# Tacotron2-Japanese
-- Tacotron2 implementation of Japanese
-## Links
-* Reference: [NVIDIA/tacotron2](https://github.com/NVIDIA/tacotron2)
-* [Pre-training tacotron2 models](https://github.com/CjangCjengh/tacotron2-japanese#models)
-* [latest changes can be viewed in this repository](https://github.com/StarxSky/tacotron2-JP) 
+# HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis
 
-## How to use
-1. Put raw Japanese texts in ./filelists
-2. Put WAV files in ./wav
-3. (Optional) Download NVIDIA's [pretrained model](https://drive.google.com/file/d/1c5ZTuT7J08wLUoVZ2KkUs_VdZuJ86ZqA/view?usp=sharing)
-4. Open ./train.ipynb to install requirements and start training
-5. Download NVIDIA's [WaveGlow model](https://drive.google.com/open?id=1rpK8CzAAirq9sWZhe9nlfvxMF1dRgFbF) or [WaveGlow model](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/EbyZnGnCJclGl5q_M3KGWTUBq4IIqSLiGznFdqHbv3WM5A?e=8c2aWE) based on Ayachi Nene
-6. Open ./inference.ipynb to generate voice
+### Jungil Kong, Jaehyeon Kim, Jaekyoung Bae
 
-## Cleaners
-File ./hparams.py line 30
-### 1. 'japanese_cleaners'
-#### Before
-何かあったらいつでも話して下さい。学院のことじゃなく、私事に関することでも何でも
-#### After
-nanikaacltaraitsudemohanashItekudasai.gakuiNnokotojanaku,shijinikaNsurukotodemonanidemo.
-### 2. 'japanese_tokenization_cleaners'
-#### Before
-何かあったらいつでも話して下さい。学院のことじゃなく、私事に関することでも何でも
-#### After
-nani ka acl tara itsu demo hanashi te kudasai. gakuiN no koto ja naku, shiji nikaNsuru koto de mo naNdemo.
-### 3. 'japanese_accent_cleaners'
-#### Before
-何かあったらいつでも話して下さい。学院のことじゃなく、私事に関することでも何でも
-#### After
-:na)nika a)cltara i)tsudemo ha(na)shIte ku(dasa)i.:ga(kuiNno ko(to)janaku,:shi)jini ka(Nsu)ru ko(to)demo na)nidemo.
-### 4. 'japanese_phrase_cleaners'
-#### Before
-何かあったらいつでも話して下さい。学院のことじゃなく、私事に関することでも何でも
-#### After
-nanika acltara itsudemo hanashIte kudasai. gakuiNno kotojanaku, shijini kaNsuru kotodemo nanidemo.
+In our [paper](https://arxiv.org/abs/2010.05646), 
+we proposed HiFi-GAN: a GAN-based model capable of generating high fidelity speech efficiently.<br/>
+We provide our implementation and pretrained models as open source in this repository.
 
-## Models
-Remember to change this line in ./inference.ipynb
-```python
-sequence = np.array(text_to_sequence(text, ['japanese_cleaners']))[None, :]
+**Abstract :**
+Several recent work on speech synthesis have employed generative adversarial networks (GANs) to produce raw waveforms. 
+Although such methods improve the sampling efficiency and memory usage, 
+their sample quality has not yet reached that of autoregressive and flow-based generative models. 
+In this work, we propose HiFi-GAN, which achieves both efficient and high-fidelity speech synthesis. 
+As speech audio consists of sinusoidal signals with various periods, 
+we demonstrate that modeling periodic patterns of an audio is crucial for enhancing sample quality. 
+A subjective human evaluation (mean opinion score, MOS) of a single speaker dataset indicates that our proposed method 
+demonstrates similarity to human quality while generating 22.05 kHz high-fidelity audio 167.9 times faster than 
+real-time on a single V100 GPU. We further show the generality of HiFi-GAN to the mel-spectrogram inversion of unseen 
+speakers and end-to-end speech synthesis. Finally, a small footprint version of HiFi-GAN generates samples 13.4 times 
+faster than real-time on CPU with comparable quality to an autoregressive counterpart.
+
+Visit our [demo website](https://jik876.github.io/hifi-gan-demo/) for audio samples.
+
+
+## Pre-requisites
+1. Python >= 3.6
+2. Clone this repository.
+3. Install python requirements. Please refer [requirements.txt](requirements.txt)
+4. Download and extract the [LJ Speech dataset](https://keithito.com/LJ-Speech-Dataset/).
+And move all wav files to `LJSpeech-1.1/wavs`
+
+
+## Training
 ```
-### Sanoba Witch
+python train.py --config config_v1.json
+```
+To train V2 or V3 Generator, replace `config_v1.json` with `config_v2.json` or `config_v3.json`.<br>
+Checkpoints and copy of the configuration file are saved in `cp_hifigan` directory by default.<br>
+You can change the path by adding `--checkpoint_path` option.
 
-#### Ayachi Nene 
+Validation loss during training with V1 generator.<br>
+![validation loss](./validation_loss.png)
 
-| Cleaners  Classes | Model |
-| ----------- | ----------- |
-| japanese_cleaners      | [Model 1](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/ESltqOvyK3ZPsLMQwpv5FH0BoX8slLVsz3eUKwHHKkg9ww?e=vc5fdd) |
-| japanese_tokenization_cleaners   | [Model 2](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/ETNLDYH_ZRpMmNR0VGALhNQB5-LiJOqTaWQz8tXtbvCV-g?e=7nf2Ec) |
-|japanese_accent_cleaners| [Model 3](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/Eb0WROtOsYBInTmQQZHf36IBSXmyVd4JiCF7OnQjOZkjGg?e=qbbsv4) |
+## Pretrained Model
+You can also use pretrained models we provide.<br/>
+[Download pretrained models](https://drive.google.com/drive/folders/1-eEYTB5Av9jNql0WGBlRoi-WH2J7bp5Y?usp=sharing)<br/> 
+Details of each folder are as in follows:
+
+|Folder Name|Generator|Dataset|Fine-Tuned|
+|------|---|---|---|
+|LJ_V1|V1|LJSpeech|No|
+|LJ_V2|V2|LJSpeech|No|
+|LJ_V3|V3|LJSpeech|No|
+|LJ_FT_T2_V1|V1|LJSpeech|Yes ([Tacotron2](https://github.com/NVIDIA/tacotron2))|
+|LJ_FT_T2_V2|V2|LJSpeech|Yes ([Tacotron2](https://github.com/NVIDIA/tacotron2))|
+|LJ_FT_T2_V3|V3|LJSpeech|Yes ([Tacotron2](https://github.com/NVIDIA/tacotron2))|
+|VCTK_V1|V1|VCTK|No|
+|VCTK_V2|V2|VCTK|No|
+|VCTK_V3|V3|VCTK|No|
+|UNIVERSAL_V1|V1|Universal|No|
+
+We provide the universal model with discriminator weights that can be used as a base for transfer learning to other datasets.
+
+## Fine-Tuning
+1. Generate mel-spectrograms in numpy format using [Tacotron2](https://github.com/NVIDIA/tacotron2) with teacher-forcing.<br/>
+The file name of the generated mel-spectrogram should match the audio file and the extension should be `.npy`.<br/>
+Example:
+    ```
+    Audio File : LJ001-0001.wav
+    Mel-Spectrogram File : LJ001-0001.npy
+    ```
+2. Create `ft_dataset` folder and copy the generated mel-spectrogram files into it.<br/>
+3. Run the following command.
+    ```
+    python train.py --fine_tuning True --config config_v1.json
+    ```
+    For other command line options, please refer to the training section.
 
 
-
-#### Inaba Meguru
-
-| Cleaners  Classes | Model |
-| ----------- | ----------- |
-| japanese_tokenization_cleaners | [Model 1](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/Ed29Owd-E1NKstl_EFGZFVABe-F-a65jSAefeW_uEQuWxw?e=J628nT)|
-| japanese_tokenization_cleaners | [Model 2](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/ER8C2tiu4-RPi_MtQ3TCuTkBVRvO1MgJOPAKpAUD4ZLiow?e=ktT81t) |
-
-
-
-### Senren Banka
-#### Tomotake Yoshino
-
-| Cleaners Classes| Model |
-| ----------- | ----------- |
-| japanese_tokenization_cleaners| [Model 1](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/EdfFetSH3tpMr7nkiqAKzwEBXjuCRICcvgUortEvE4pdjw?e=UyvkyI)|
-| japanese_phrase_cleaners| [Model 2](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/EeE4h5teC5xKms1VRnaNiW8BuqslFeR8VW7bCk7SWh2r8w?e=qADqbu)|
+## Inference from wav file
+1. Make `test_files` directory and copy wav files into the directory.
+2. Run the following command.
+    ```
+    python inference.py --checkpoint_file [generator checkpoint file path]
+    ```
+Generated wav files are saved in `generated_files` by default.<br>
+You can change the path by adding `--output_dir` option.
 
 
-#### Murasame
+## Inference for end-to-end speech synthesis
+1. Make `test_mel_files` directory and copy generated mel-spectrogram files into the directory.<br>
+You can generate mel-spectrograms using [Tacotron2](https://github.com/NVIDIA/tacotron2), 
+[Glow-TTS](https://github.com/jaywalnut310/glow-tts) and so forth.
+2. Run the following command.
+    ```
+    python inference_e2e.py --checkpoint_file [generator checkpoint file path]
+    ```
+Generated wav files are saved in `generated_files_from_mel` by default.<br>
+You can change the path by adding `--output_dir` option.
 
-| Cleaners Classes| Model |
-| ----------- | ----------- |
-| japanese_accent_cleaners| [Model 1](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/EVXUY5tNA4JOqsVL7of8GrEB4WFPrcZPRWX0MP_7G0RXfg?e=5wzBlw)|
 
-
-
-### RIDDLE JOKER
-#### Arihara Nanami
-
-| Cleaners Classes| Model |
-| ----------- | ----------- |
-| japanese_accent_cleaners|[Model 1](https://sjtueducn-my.sharepoint.com/:u:/g/personal/cjang_cjengh_sjtu_edu_cn/EdxWxcjx5XdAncOdoTjtyK0BUvrigdcBb2LPmzL48q4smw?e=OlAU66)|
+## Acknowledgements
+We referred to [WaveGlow](https://github.com/NVIDIA/waveglow), [MelGAN](https://github.com/descriptinc/melgan-neurips) 
+and [Tacotron2](https://github.com/NVIDIA/tacotron2) to implement this.
 

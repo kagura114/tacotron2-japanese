@@ -1,293 +1,280 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import itertools
 import os
 import time
-import math
-import torch
 import argparse
-import torch.distributed as dist
+import json
+import torch
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DistributedSampler, DataLoader
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group
+from torch.nn.parallel import DistributedDataParallel
+from env import AttrDict, build_env
+from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
+    discriminator_loss
+from hifiutils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+
+torch.backends.cudnn.benchmark = True
 
 
-from numpy import finfo
-from model import Tacotron2
-from torch.backends import cudnn
-from hparams import create_hparams
-from logger import Tacotron2Logger
-from torch.utils.data import DataLoader
-from loss_function import Tacotron2Loss
-from distributed import apply_gradient_allreduce
-from data_utils import TextMelLoader, TextMelCollate
-from torch.utils.data.distributed import DistributedSampler
+def train(rank, a, h, warm_start):
+    if h.num_gpus > 1:
+        init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
+                        world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
 
+    torch.cuda.manual_seed(h.seed)
+    device = torch.device('cuda:{:d}'.format(rank))
 
-device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
+    generator = Generator(h).to(device)
+    mpd = MultiPeriodDiscriminator().to(device)
+    msd = MultiScaleDiscriminator().to(device)
 
-# 整理tensor
-def reduce_tensor(tensor, n_gpus):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= n_gpus
-    return rt
-
-
-def init_distributed(hparams, n_gpus, rank, group_name):
-    #assert torch.cuda.is_available(), "Distributed mode requires CUDA."
-    if torch.cuda.is_available() :
-        # Set cuda device so everything is done on the right GPU.
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-        # Initialize distributed communication
-        dist.init_process_group(backend=hparams.dist_backend,
-                                init_method=hparams.dist_url,
-                                world_size=n_gpus,
-                                rank=rank,
-                                group_name=group_name)
-        print("Distributed mode requires CUDA.")
-    else :
-        print("Use the CPU")
-    print("Initializing Distributed")
-
-    print("Done initializing distributed")
-
-
-
-def prepare_dataloaders(hparams):
-    # Get data, data loaders and collate function ready
-    trainset = TextMelLoader(hparams.training_files, hparams)
-    valset = TextMelLoader(hparams.validation_files, hparams)
-    collate_fn = TextMelCollate(hparams.n_frames_per_step)
-
-    if hparams.distributed_run:
-        train_sampler = DistributedSampler(trainset)
-        shuffle = False
-    else:
-        train_sampler = None
-        shuffle = True
-
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=shuffle,
-                              sampler=train_sampler,
-                              batch_size=hparams.batch_size, pin_memory=False,
-                              drop_last=True, collate_fn=collate_fn)
-    return train_loader, valset, collate_fn
-
-
-def prepare_directories_and_logger(output_directory, log_directory, rank):
     if rank == 0:
-        if not os.path.isdir(output_directory):
-            os.makedirs(output_directory)
-            os.chmod(output_directory, 0o775)
-        logger = Tacotron2Logger(os.path.join(output_directory, log_directory))
+        print(generator)
+        os.makedirs(a.checkpoint_path, exist_ok=True)
+        print("checkpoints directory : ", a.checkpoint_path)
+
+    if os.path.isdir(a.checkpoint_path):
+        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
+        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+
+    steps = 0
+    if cp_g is None or cp_do is None:
+        state_dict_do = None
+        last_epoch = -1
     else:
-        logger = None
-    return logger
-
-
-def load_model(hparams):
-    model = Tacotron2(hparams)
-    model.to(device)
-    if hparams.fp16_run:
-        model.decoder.attention_layer.score_mask_value = finfo('float16').min
-
-    if hparams.distributed_run:
-        model = apply_gradient_allreduce(model)
-
-    return model
-
-
-def warm_start_model(checkpoint_path, model, ignore_layers):
-    assert os.path.isfile(checkpoint_path)
-    print("Warm starting model from checkpoint '{}'".format(checkpoint_path))
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    model_dict = checkpoint_dict['state_dict']
-    if len(ignore_layers) > 0:
-        model_dict = {k: v for k, v in model_dict.items()
-                      if k not in ignore_layers}
-        dummy_dict = model.state_dict()
-        dummy_dict.update(model_dict)
-        model_dict = dummy_dict
-    model.load_state_dict(model_dict)
-    return model
-
-
-def load_checkpoint(checkpoint_path, model, optimizer):
-    assert os.path.isfile(checkpoint_path)
-    print("Loading checkpoint '{}'".format(checkpoint_path))
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint_dict['state_dict'])
-    optimizer.load_state_dict(checkpoint_dict['optimizer'])
-    learning_rate = checkpoint_dict['learning_rate']
-    iteration = checkpoint_dict['iteration']
-    print("Loaded checkpoint '{}' from iteration {}" .format(
-        checkpoint_path, iteration))
-    return model, optimizer, learning_rate, iteration
-
-
-def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
-    print("Saving model and optimizer state at iteration {} to {}".format(
-        iteration, filepath))
-    torch.save({'iteration': iteration,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'learning_rate': learning_rate}, filepath)
-
-
-def validate(model, criterion, valset, iteration, batch_size, n_gpus,
-             collate_fn, logger, distributed_run, rank):
-    """Handles all the validation scoring and printing"""
-    model.eval()
-    with torch.no_grad():
-        val_sampler = DistributedSampler(valset) if distributed_run else None
-        val_loader = DataLoader(valset, sampler=val_sampler, num_workers=1,
-                                shuffle=False, batch_size=batch_size,
-                                pin_memory=False, collate_fn=collate_fn)
-
-        val_loss = 0.0
-        for i, batch in enumerate(val_loader):
-            x, y = model.parse_batch(batch)
-            y_pred = model(x)
-            loss = criterion(y_pred, y)
-            if distributed_run:
-                reduced_val_loss = reduce_tensor(loss.data, n_gpus).item()
-            else:
-                reduced_val_loss = loss.item()
-            val_loss += reduced_val_loss
-        val_loss = val_loss / (i + 1)
-
-    model.train()
-    if rank == 0:
-        print("Validation loss {}: {:9f}  ".format(iteration, val_loss))
-        logger.log_validation(val_loss, model, y, y_pred, iteration)
-
-
-def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
-          rank, group_name, hparams):
-    """Training and validation logging results to tensorboard and stdout
-
-    Params
-    ------
-    output_directory (string): directory to save checkpoints
-    log_directory (string) directory to save tensorboard logs
-    checkpoint_path(string): checkpoint path
-    n_gpus (int): number of gpus
-    rank (int): rank of current gpu
-    hparams (object): comma separated list of "name=value" pairs.
-    """
-    if hparams.distributed_run:
-        init_distributed(hparams, n_gpus, rank, group_name)
-
-    torch.manual_seed(hparams.seed)
-    torch.cuda.manual_seed(hparams.seed)
-
-    model = load_model(hparams)
-    learning_rate = hparams.learning_rate
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
-                                 weight_decay=hparams.weight_decay)
-
-    # 默认的是 False 可以注释掉
-    #if hparams.fp16_run:
-    #    from apex import amp
-    #    model, optimizer = amp.initialize(
-    #        model, optimizer, opt_level='O2')
-
-    if hparams.distributed_run:
-        model = apply_gradient_allreduce(model)
-
-    criterion = Tacotron2Loss()
-    logger = prepare_directories_and_logger(output_directory, log_directory, rank)
-    train_loader, valset, collate_fn = prepare_dataloaders(hparams)
-
-    # Load checkpoint if one exists
-    iteration = 0
-    epoch_offset = 0
-    if checkpoint_path is not None:
+        state_dict_g = load_checkpoint(cp_g, device)
+        state_dict_do = load_checkpoint(cp_do, device)
+        generator.load_state_dict(state_dict_g['generator'])
+        mpd.load_state_dict(state_dict_do['mpd'])
+        msd.load_state_dict(state_dict_do['msd'])
         if warm_start:
-            model = warm_start_model(
-                checkpoint_path, model, hparams.ignore_layers)
+            steps = 1
+            last_epoch = 0
         else:
-            model, optimizer, _learning_rate, iteration = load_checkpoint(
-                checkpoint_path, model, optimizer)
-            if hparams.use_saved_learning_rate:
-                learning_rate = _learning_rate
-            iteration += 1  # next iteration is iteration + 1
-            epoch_offset = max(0, int(iteration / len(train_loader)))
+            steps = state_dict_do['steps'] + 1
+            last_epoch = state_dict_do['epoch']
 
-    model.train()
-    is_overflow = False
-    # ================ MAIN TRAINNIG LOOP! ===================
-    for epoch in range(epoch_offset, hparams.epochs):
-        print("Epoch: {}".format(epoch))
+    if h.num_gpus > 1:
+        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
+        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
+        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+
+    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
+                                h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+
+    if state_dict_do is not None or warm_start:
+        optim_g.load_state_dict(state_dict_do['optim_g'])
+        optim_d.load_state_dict(state_dict_do['optim_d'])
+    if warm_start:
+        optim_g.param_groups[0]["lr"] = h.learning_rate
+        optim_d.param_groups[0]["lr"] = h.learning_rate
+
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
+
+    training_filelist, validation_filelist = get_dataset_filelist(a)
+
+    trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
+                        h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
+                        shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
+                        fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir)
+
+    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+
+    train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=False,
+                            sampler=train_sampler,
+                            batch_size=h.batch_size,
+                            pin_memory=True,
+                            drop_last=True)
+
+    if rank == 0:
+        validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
+                            h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
+                            fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
+                            base_mels_path=a.input_mels_dir)
+        validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
+                                    sampler=None,
+                                    batch_size=1,
+                                    pin_memory=True,
+                                    drop_last=True)
+
+        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
+
+    generator.train()
+    mpd.train()
+    msd.train()
+    for epoch in range(max(0, last_epoch), a.training_epochs):
+        for param_group in optim_g.param_groups:
+            print("Current learning rate: " + str(param_group["lr"]))
+        if rank == 0:
+            start = time.time()
+            print("Epoch: {}".format(epoch+1))
+
+        if h.num_gpus > 1:
+            train_sampler.set_epoch(epoch)
+
         for i, batch in enumerate(train_loader):
-            start = time.perf_counter()
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = learning_rate
+            if rank == 0:
+                start_b = time.time()
+            x, y, _, y_mel = batch
+            x = torch.autograd.Variable(x.to(device, non_blocking=True))
+            y = torch.autograd.Variable(y.to(device, non_blocking=True))
+            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            y = y.unsqueeze(1)
 
-            model.zero_grad()
-            x, y = model.parse_batch(batch)
-            y_pred = model(x)
+            y_g_hat = generator(x)
+            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                        h.fmin, h.fmax_for_loss)
 
-            loss = criterion(y_pred, y)
-            if hparams.distributed_run:
-                reduced_loss = reduce_tensor(loss.data, n_gpus).item()
-            else:
-                reduced_loss = loss.item()
+            optim_d.zero_grad()
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip_thresh)
-            optimizer.step()
+            # MPD
+            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-            if not is_overflow and rank == 0:
-                duration = time.perf_counter() - start
-                print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
-                    iteration, reduced_loss, grad_norm, duration))
-                logger.log_training(
-                    reduced_loss, grad_norm, learning_rate, duration, iteration)
+            # MSD
+            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-            if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
-                validate(model, criterion, valset, iteration,
-                         hparams.batch_size, n_gpus, collate_fn, logger,
-                         hparams.distributed_run, rank)
-                if rank == 0:
-                    checkpoint_path = os.path.join(
-                        output_directory, "checkpoint_{}".format(iteration))
-                    save_checkpoint(model, optimizer, learning_rate, iteration,
-                                    checkpoint_path)
+            loss_disc_all = loss_disc_s + loss_disc_f
 
-            iteration += 1
+            loss_disc_all.backward()
+            optim_d.step()
 
+            # Generator
+            optim_g.zero_grad()
+
+            # L1 Mel-Spectrogram Loss
+            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+
+            loss_gen_all.backward()
+            optim_g.step()
+
+            if rank == 0:
+                # STDOUT logging
+                if steps % a.stdout_interval == 0:
+                    with torch.no_grad():
+                        mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
+
+                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
+                        format(steps, loss_gen_all, mel_error, time.time() - start_b))
+
+                # checkpointing
+                if steps % a.checkpoint_interval == 0 and steps != 0:
+                    checkpoint_path = "{}/g_00000000".format(a.checkpoint_path)
+                    save_checkpoint(checkpoint_path,
+                                    {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
+                    checkpoint_path = "{}/do_00000000".format(a.checkpoint_path)
+                    save_checkpoint(checkpoint_path, 
+                                    {'mpd': (mpd.module if h.num_gpus > 1
+                                                        else mpd).state_dict(),
+                                    'msd': (msd.module if h.num_gpus > 1
+                                                        else msd).state_dict(),
+                                    'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
+                                    'epoch': epoch})
+
+                # Tensorboard summary logging
+                if steps % a.summary_interval == 0:
+                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
+                    sw.add_scalar("training/mel_spec_error", mel_error, steps)
+
+                # Validation
+                if steps % a.validation_interval == 0 and not a.fine_tuning:  # and steps != 0:
+                    generator.eval()
+                    torch.cuda.empty_cache()
+                    val_err_tot = 0
+                    with torch.no_grad():
+                        for j, batch in enumerate(validation_loader):
+                            x, y, _, y_mel = batch
+                            y_g_hat = generator(x.to(device))
+                            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+                            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
+                                                        h.hop_size, h.win_size,
+                                                        h.fmin, h.fmax_for_loss)
+                            val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+
+                            if j <= 4:
+                                if steps == 0:
+                                    sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
+                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
+
+                                sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
+                                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
+                                                            h.sampling_rate, h.hop_size, h.win_size,
+                                                            h.fmin, h.fmax)
+                                sw.add_figure('generated/y_hat_spec_{}'.format(j),
+                                            plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+
+                        val_err = val_err_tot / (j+1)
+                        sw.add_scalar("validation/mel_spec_error", val_err, steps)
+
+                    generator.train()
+
+            steps += 1
+
+        scheduler_g.step()
+        scheduler_d.step()
+        
+        if rank == 0:
+            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+
+
+def main():
+    print('Initializing Training Process..')
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--group_name', default=None)
+    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
+    parser.add_argument('--input_mels_dir', default='ft_dataset')
+    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
+    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+    parser.add_argument('--checkpoint_path', default='cp_hifigan')
+    parser.add_argument('--config', default='')
+    parser.add_argument('--training_epochs', default=3100, type=int)
+    parser.add_argument('--stdout_interval', default=5, type=int)
+    parser.add_argument('--checkpoint_interval', default=5000, type=int)
+    parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument('--validation_interval', default=1000, type=int)
+    parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--warm_start', default=False, type=bool)
+
+    a = parser.parse_args()
+
+    with open(a.config) as f:
+        data = f.read()
+
+    json_config = json.loads(data)
+    h = AttrDict(json_config)
+    build_env(a.config, 'config.json', a.checkpoint_path)
+
+    torch.manual_seed(h.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(h.seed)
+        h.num_gpus = torch.cuda.device_count()
+        h.batch_size = int(h.batch_size / h.num_gpus)
+        print('Batch size per GPU :', h.batch_size)
+    else:
+        pass
+
+    if h.num_gpus > 1:
+        mp.spawn(train, nprocs=h.num_gpus, args=(a, h, a.warm_start,))
+    else:
+        train(0, a, h, a.warm_start)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--output_directory', type=str,
-                        help='directory to save checkpoints ')
-    parser.add_argument('-l', '--log_directory', type=str,
-                        help='directory to save tensorboard logs')
-    parser.add_argument('-c', '--checkpoint_path', type=str, default=None,
-                        required=False, help='checkpoint path')
-    parser.add_argument('--warm_start', action='store_true',
-                        help='load model weights only, ignore specified layers')
-    parser.add_argument('--n_gpus', type=int, default=1,
-                        required=False, help='number of gpus')
-    parser.add_argument('--rank', type=int, default=0,
-                        required=False, help='rank of current gpu')
-    parser.add_argument('--group_name', type=str, default='group_name',
-                        required=False, help='Distributed group name')
-    parser.add_argument('--hparams', type=str,
-                        required=False, help='comma separated name=value pairs')
-
-    args = parser.parse_args()
-    hparams = create_hparams()
-
-    cudnn.enabled = hparams.cudnn_enabled#create_hparams.cudnn_enabled
-    cudnn.benchmark = hparams.cudnn_benchmark#create_hparams.cudnn_benchmark
-
-    print("FP16 Run:", hparams.fp16_run)
-    print("Dynamic Loss Scaling:", hparams.dynamic_loss_scaling)
-    print("Distributed Run:", hparams.distributed_run)
-    print("cuDNN Enabled:", hparams.cudnn_enabled)
-    print("cuDNN Benchmark:", hparams.cudnn_benchmark)
-
-    train(args.output_directory,
-          args.log_directory,
-          args.checkpoint_path,
-          args.warm_start,
-          args.n_gpus,
-          args.rank,
-          args.group_name,
-          hparams)
+    main()
